@@ -12,6 +12,8 @@ import pandas as pd
 import random
 import pickle as pkl
 import argparse
+from munkres import Munkres
+import itertools
 
 
 def get_test_input(input_dim, CUDA):
@@ -30,9 +32,9 @@ def get_test_input(input_dim, CUDA):
 
 def prep_image(img, inp_dim):
     """
-    Prepare image for inputting to the neural network. 
+    Prepare image for inputting to the neural network.
 
-    Returns a Variable 
+    Returns a Variable
     """
 
     orig_im = img
@@ -47,7 +49,7 @@ def write(x, img):
     c1 = tuple(x[1:3].int())
     c2 = tuple(x[3:5].int())
     cls = int(x[-1])
-    label = "{0}".format(classes[cls])
+    label = "{0}".format(object_classes[cls])
     color = random.choice(colors)
     cv2.rectangle(img, c1, c2, color, 1)
     t_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_PLAIN, 1, 1)[0]
@@ -84,7 +86,211 @@ def arg_parse():
     return parser.parse_args()
 
 
+def bb_intersection_over_union(boxA, boxB):
+    # determine the (x, y)-coordinates of the intersection rectangle
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+
+    # compute the area of intersection rectangle
+    interArea = abs(max((xB - xA, 0)) * max((yB - yA), 0))
+    if interArea == 0:
+        return 0
+    # compute the area of both the prediction and ground-truth
+    # rectangles
+    boxAArea = abs((boxA[2] - boxA[0]) * (boxA[3] - boxA[1]))
+    boxBArea = abs((boxB[2] - boxB[0]) * (boxB[3] - boxB[1]))
+
+    # compute the intersection over union by taking the intersection
+    # area and dividing it by the sum of prediction + ground-truth
+    # areas - the interesection area
+    iou = interArea / float(boxAArea + boxBArea - interArea)
+
+    # return the intersection over union value
+    return iou
+
+
+class ImageObject:
+    # Class variable
+    latest_id = 0
+
+    def __init__(self, bbox, class_):
+        self.id = None
+        self.bbox = bbox
+        self.class_ = class_
+        self.color = None
+
+    def assign_id(self):
+        self.id = ImageObject.latest_id
+        ImageObject.latest_id += 1
+
+        colors = pkl.load(open("pallete", "rb"))
+        self.color = random.choice(colors)
+
+    def calc_iou(self, another_object):
+        """
+        Returns intersection over union (IOU) among two bounding boxes
+
+        Parameters
+        ----------
+        another_object: ImageObject
+
+        Returns
+        -------
+        iou: float
+
+        """
+
+        boxA = self.bbox
+        boxB = another_object.bbox
+
+        # determine the (x, y)-coordinates of the intersection rectangle
+        xA = max(boxA[0], boxB[0])
+        yA = max(boxA[1], boxB[1])
+        xB = min(boxA[2], boxB[2])
+        yB = min(boxA[3], boxB[3])
+
+        # compute the area of intersection rectangle
+        interArea = abs(max((xB - xA, 0)) * max((yB - yA), 0))
+        if interArea == 0:
+            return 0
+        # compute the area of both the prediction and ground-truth
+        # rectangles
+        boxAArea = abs((boxA[2] - boxA[0]) * (boxA[3] - boxA[1]))
+        boxBArea = abs((boxB[2] - boxB[0]) * (boxB[3] - boxB[1]))
+
+        # compute the intersection over union by taking the intersection
+        # area and dividing it by the sum of prediction + ground-truth
+        # areas - the interesection area
+        iou = interArea / float(boxAArea + boxBArea - interArea)
+
+        # return the intersection over union value
+        return iou
+
+
+class Tracker:
+    def __init__(self):
+        self.max_objs = 16
+        self.objs = []
+
+    def track(self, prediction, img):
+        # get bounding boxes from prediction
+        tmp = prediction.cpu().detach().numpy().copy()
+        bboxes = tmp[:, 1:5]
+        classes = tmp[:, -1].astype(int)
+
+        new_objs = [ImageObject(bbox, class_)
+                    for bbox, class_ in zip(bboxes, classes)]
+
+        # reject objects with high overlap for tracking robustness
+        def remove_overlapping_objects(objs):
+            objs_to_pop = []
+            for i in range(len(objs)):
+                for j in range(len(objs[i:])):
+                    iou = new_objs[i].calc_iou(objs[i+j])
+                    if 0.4 < iou < 1:
+                        objs_to_pop.append(i+j)
+            if len(objs_to_pop) > 0:
+                # remove duplicates
+                objs_to_pop = list(dict.fromkeys(objs_to_pop))
+                # sort in reverse order
+                objs_to_pop = sorted(objs_to_pop)[::-1]
+                for x in objs_to_pop:
+                    objs.pop(x)
+        remove_overlapping_objects(new_objs)
+
+        # return if no object in prediction
+        if len(new_objs) == 0:
+            return
+
+        # if no object in tracker
+        if len(self.objs) == 0:
+            # store objects
+            if len(new_objs) > self.max_objs:
+                self.objs = new_objs[:self.max_objs]
+            else:
+                self.objs = new_objs
+            # assign unique id to each object
+            for obj in self.objs:
+                obj.assign_id()
+            return
+
+        # assume at least one object for self.objs and new_objs from here on
+        iou_matrix = np.array([[self.objs[i].calc_iou(new_objs[j]) for j in range(len(new_objs))]
+                               for i in range(len(self.objs))])
+        # append dummy zeros if new_objs < self.objs
+        if len(new_objs) < len(self.objs):
+            iou_matrix = np.concatenate([
+                iou_matrix,
+                np.zeros((len(self.objs), len(self.objs)-len(new_objs)))], axis=1)
+
+        # Hungarian algorithm
+        m = Munkres()
+        result = m.compute(-1*iou_matrix.copy())
+
+        assignment = np.array([[src, dst, iou_matrix[src][dst]]
+                               for src, dst in result])
+
+        # sort in descending order based on IOU
+        assignment = assignment[np.argsort(assignment[:, 2])[::-1]]
+
+        tracked_objects = []
+        stray_objects = []
+        for a in assignment:
+            src = int(a[0])
+            dst = int(a[1])
+            iou = a[2]
+
+            if iou > 0.2 and len(tracked_objects) < self.max_objs:
+                # continue to track this object
+                tracked_objects.append(self.objs[src])
+                # update bbox location
+                tracked_objects[-1].bbox = new_objs[dst].bbox
+                # update class
+                tracked_objects[-1].class_ = new_objs[dst].class_
+            else:
+                # consider the object as a new object
+                # make sure dst does not point to a dummy object
+                if dst < len(new_objs):
+                    stray_objects.append(new_objs[dst])
+
+        # append other objects which were kicked out from assignment
+        stray_objects += [new_objs[i] for i in range(
+            len(new_objs)) if i not in assignment[:, 1]]
+
+        # pick up stray objects if there is room
+        for s in stray_objects:
+            if len(tracked_objects) < self.max_objs:
+                # track the object
+                tracked_objects.append(s)
+                # assign a unique ID
+                tracked_objects[-1].assign_id()
+
+        remove_overlapping_objects(tracked_objects)
+
+        self.objs = tracked_objects
+
+        for i in range(len(self.objs)):
+            obj = self.objs[i]
+            c1 = tuple(obj.bbox[0:2].astype(int))
+            c2 = tuple(obj.bbox[2:4].astype(int))
+            cv2.rectangle(img, c1, c2, obj.color, 1)
+
+            label = "{0}:{1}".format(str(obj.id), object_classes[obj.class_])
+            t_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_PLAIN, 1, 1)[0]
+            c1 = c1[0], c1[1] - t_size[1] - 4
+            c2 = c1[0] + t_size[0] + 3, c1[1] + t_size[1] + 4
+            cv2.rectangle(img, c1, c2, obj.color, -1)
+            cv2.putText(img, label, (c1[0], c1[1] + t_size[1] + 4),
+                        cv2.FONT_HERSHEY_PLAIN, 1, [225, 255, 255], 1)
+
+        return
+
+
 if __name__ == '__main__':
+    tracker = Tracker()
+
     args = arg_parse()
     confidence = float(args.confidence)
     nms_thesh = float(args.nms_thresh)
@@ -121,12 +327,24 @@ if __name__ == '__main__':
 
     assert cap.isOpened(), 'Cannot capture source'
 
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+
+    fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+    videowriter = cv2.VideoWriter(
+        'output.avi', fourcc, fps, (W, H))
+
+    counter = 0
     frames = 0
     start = time.time()
     while cap.isOpened():
-
+        counter += 1
         ret, frame = cap.read()
         if ret:
+            if(counter % 1 != 0):
+                continue
 
             img, orig_im, dim = prep_image(frame, inp_dim)
 
@@ -167,10 +385,12 @@ if __name__ == '__main__':
                 output[i, [2, 4]] = torch.clamp(
                     output[i, [2, 4]], 0.0, im_dim[i, 1])
 
-            classes = load_classes('data/coco.names')
+            object_classes = load_classes('data/coco.names')
             colors = pkl.load(open("pallete", "rb"))
 
-            list(map(lambda x: write(x, orig_im), output))
+            tracker.track(output, orig_im)
+
+            videowriter.write(orig_im)
 
             cv2.imshow("frame", orig_im)
             key = cv2.waitKey(1)
@@ -182,3 +402,4 @@ if __name__ == '__main__':
 
         else:
             break
+    videowriter.release()
