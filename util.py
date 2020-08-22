@@ -98,6 +98,9 @@ def unique(tensor):
 
 def write_results(prediction, confidence, num_classes, nms = True, nms_conf = 0.4):
     conf_mask = (prediction[:,:,4] > confidence).float().unsqueeze(2)
+    # no detected objects
+    if torch.sum(conf_mask).item() == 0:
+        return 0
     prediction = prediction*conf_mask
     
 
